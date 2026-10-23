@@ -1,0 +1,11 @@
+{
+  "model_type": "RandomForestClassifier",
+  "target_type": "binary",
+  "classes": {
+    "0": "Benign",
+    "1": "Attack"
+  },
+  "feature_count": 77,
+  "test_accuracy": 0.9981500250056429,
+  "test_roc_auc": 0.9999679117787763
+}
