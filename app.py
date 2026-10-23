@@ -175,3 +175,84 @@ def predict(request: PredictionRequest):
             status_code=422,
             detail=f"Invalid feature values: {exc}",
         ) from exc
+
+# --------------------------------------------------
+# Lightweight feature-importance explanation
+# --------------------------------------------------
+
+@app.post("/explain")
+def explain(request: PredictionRequest):
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The trained model is not available."
+        )
+
+    supplied = request.features
+    expected = set(feature_names)
+    received = set(supplied)
+
+    missing = sorted(expected - received)
+    unexpected = sorted(received - expected)
+
+    if missing or unexpected:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Feature names do not match the model.",
+                "missing_features": missing,
+                "unexpected_features": unexpected,
+            }
+        )
+
+    try:
+        values = np.asarray(
+            [supplied[name] for name in feature_names],
+            dtype=np.float64
+        )
+
+        if not np.isfinite(values).all():
+            raise ValueError("Feature values must be finite.")
+
+        input_row = values.reshape(1, -1)
+
+        prediction = int(model.predict(input_row)[0])
+        probabilities = model.predict_proba(input_row)[0]
+
+        importances = model.feature_importances_
+
+        ranked_features = sorted(
+            [
+                {
+                    "feature": name,
+                    "input_value": float(supplied[name]),
+                    "global_importance": float(importance),
+                }
+                for name, importance in zip(
+                    feature_names, importances
+                )
+            ],
+            key=lambda item: item["global_importance"],
+            reverse=True
+        )
+
+        return {
+            "classification": (
+                "Attack" if prediction == 1 else "Benign"
+            ),
+            "attack_probability": round(
+                float(probabilities[1]), 6
+            ),
+            "top_features": ranked_features[:10],
+            "explanation_type": "Global Random Forest feature importance",
+            "note": (
+                "These features are globally important to the model; "
+                "they are not per-sample SHAP contributions."
+            )
+        }
+
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid feature values: {exc}"
+        ) from exc
