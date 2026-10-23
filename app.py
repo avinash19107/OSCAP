@@ -256,3 +256,153 @@ def explain(request: PredictionRequest):
             status_code=422,
             detail=f"Invalid feature values: {exc}"
         ) from exc
+        
+# --------------------------------------------------
+# Module 4: Concept Drift Detection
+# --------------------------------------------------
+
+from statistics import median
+
+# --------------------------------------------------
+# Module 4: Concept Drift Detection
+# --------------------------------------------------
+
+DRIFT_BASELINE_PATH = MODEL_DIR / "drift_baseline.json"
+
+try:
+    with open(DRIFT_BASELINE_PATH, "r", encoding="utf-8") as f:
+        drift_baseline = json.load(f)
+    print("Drift baseline loaded successfully.")
+except Exception as exc:
+    drift_baseline = {}
+    print(f"DRIFT BASELINE ERROR: {type(exc).__name__}: {exc}")
+
+
+class DriftRequest(BaseModel):
+    samples: list[dict[str, float]] = Field(
+        ...,
+        min_length=2,
+        description="At least two network-flow samples."
+    )
+
+
+@app.get("/drift/status")
+def drift_status():
+    return {
+        "baseline_loaded": bool(drift_baseline),
+        "features": list(drift_baseline.keys()),
+        "message": (
+            "Drift baseline ready."
+            if drift_baseline
+            else "Baseline unavailable. Check drift_baseline.json."
+        )
+    }
+
+
+@app.post("/drift")
+def detect_drift(request: DriftRequest):
+    if not drift_baseline:
+        raise HTTPException(
+            status_code=503,
+            detail="Drift baseline is not available."
+        )
+
+    if len(request.samples) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least two samples."
+        )
+
+    baseline_features = list(drift_baseline.keys())
+    expected = set(baseline_features)
+
+    current = {name: [] for name in baseline_features}
+
+    for index, sample in enumerate(request.samples):
+        received = set(sample.keys())
+        missing = sorted(expected - received)
+        unexpected = sorted(received - expected)
+
+        if missing or unexpected:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "sample_index": index,
+                    "missing_features": missing,
+                    "unexpected_features": unexpected
+                }
+            )
+
+        for name in baseline_features:
+            try:
+                value = float(sample[name])
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid value for {name} in sample {index}."
+                )
+
+            if not np.isfinite(value):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Non-finite value for {name} in sample {index}."
+                )
+
+            current[name].append(value)
+
+    results = []
+    shifted_count = 0
+
+    for name in baseline_features:
+        reference = drift_baseline[name]
+        values = sorted(current[name])
+
+        current_median = float(np.median(values))
+        current_q25 = float(np.percentile(values, 25))
+        current_q75 = float(np.percentile(values, 75))
+
+        baseline_median = float(reference["median"])
+        baseline_q25 = float(reference["q25"])
+        baseline_q75 = float(reference["q75"])
+
+        baseline_iqr = baseline_q75 - baseline_q25
+        current_iqr = current_q75 - current_q25
+
+        # Normalize median shift by baseline IQR.
+        # A small floor avoids division by zero.
+        scale = max(abs(baseline_iqr), 1e-9)
+        median_shift = abs(current_median - baseline_median) / scale
+
+        # Flag a feature when its median shifts by more than
+        # one baseline IQR. This is a heuristic, not a statistical test.
+        shifted = median_shift > 1.0
+
+        if shifted:
+            shifted_count += 1
+
+        results.append({
+            "feature": name,
+            "baseline_median": baseline_median,
+            "current_median": current_median,
+            "baseline_iqr": baseline_iqr,
+            "current_iqr": current_iqr,
+            "normalized_median_shift": round(median_shift, 4),
+            "shift_detected": shifted
+        })
+
+    drift_detected = shifted_count > 0
+
+    return {
+        "samples_analyzed": len(request.samples),
+        "drift_detected": drift_detected,
+        "shifted_feature_count": shifted_count,
+        "total_features_checked": len(baseline_features),
+        "method": "Median shift normalized by benign baseline IQR",
+        "threshold": 1.0,
+        "warning": (
+            "Distribution drift does not prove an attack. "
+            "Investigate alongside model predictions and traffic context."
+        ),
+        "feature_results": results
+    }
+
